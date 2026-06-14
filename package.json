@@ -1,0 +1,11 @@
+{
+  "name": "kmi27-hf-proxy",
+  "version": "1.0.0",
+  "description": "Node.js proxy for Kimi K2.7 Code HF Space",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["proxy", "huggingface", "gradio", "kimi"],
+  "license": "MIT"
+}
