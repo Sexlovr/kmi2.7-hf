@@ -172,6 +172,96 @@ function streamAndCollect(url, res, formatToken) {
   });
 }
 
+// ══════════════════════════════════════════
+//  Tool Call Converter
+//  Kimi outputs {"tool_calls":...} as a string inside content.
+//  This converts it to proper OpenAI tool_calls format.
+// ══════════════════════════════════════════
+
+function tryParseToolCalls(text) {
+  if (!text || typeof text !== "string") return null;
+  const trimmed = text.trim();
+
+  // Direct JSON object with tool_calls
+  if (trimmed.startsWith('{"tool_calls"') || trimmed.startsWith('{"tool_calls":')) {
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj.tool_calls) return normalizeToolCalls(obj.tool_calls);
+    } catch {}
+  }
+
+  // JSON embedded in text: extract the first { ... } block
+  const jsonStart = trimmed.indexOf('{"tool_calls"');
+  if (jsonStart > 0) {
+    // Find matching closing brace
+    let depth = 0;
+    for (let i = jsonStart; i < trimmed.length; i++) {
+      if (trimmed[i] === "{") depth++;
+      else if (trimmed[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const obj = JSON.parse(trimmed.slice(jsonStart, i + 1));
+            if (obj.tool_calls) return normalizeToolCalls(obj.tool_calls);
+          } catch {}
+          break;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function normalizeToolCalls(tc) {
+  // Already an array of proper tool_calls
+  if (Array.isArray(tc)) {
+    return tc.map((t, i) => ({
+      id: t.id || `call_${crypto.randomBytes(8).toString("hex")}`,
+      type: "function",
+      function: {
+        name: t.function?.name || t.name || "unknown",
+        arguments: typeof t.function?.arguments === "string"
+          ? t.function.arguments
+          : typeof t.arguments === "string"
+          ? t.arguments
+          : JSON.stringify(t.function?.arguments || t.arguments || {}),
+      },
+    }));
+  }
+
+  // Single tool_call object: {"type":"function","function":{"name":"...","arguments":"..."}}
+  if (tc.type === "function" && tc.function) {
+    return [{
+      id: tc.id || `call_${crypto.randomBytes(8).toString("hex")}`,
+      type: "function",
+      function: {
+        name: tc.function.name || "unknown",
+        arguments: typeof tc.function.arguments === "string"
+          ? tc.function.arguments
+          : JSON.stringify(tc.function.arguments || {}),
+      },
+    }];
+  }
+
+  // {"tool_calls": {"type":"function","function":{...}}} (the case the user showed)
+  if (tc.type === "function" && tc.function) {
+    return [{
+      id: `call_${crypto.randomBytes(8).toString("hex")}`,
+      type: "function",
+      function: {
+        name: tc.function.name || "unknown",
+        arguments: typeof tc.function.arguments === "string"
+          ? tc.function.arguments
+          : JSON.stringify(tc.function.arguments || {}),
+      },
+    }];
+  }
+
+  // Unknown format, try to salvage
+  return null;
+}
+
 function openAIFormatToken(token) {
   const chunk = {
     id: generateId(),
@@ -313,6 +403,14 @@ const server = http.createServer(async (req, res) => {
         res.end();
       } else {
         const fullText = await collectSSE(sseUrl);
+
+        // Check if response is a tool call
+        const toolCalls = tryParseToolCalls(fullText);
+
+        const message = toolCalls
+          ? { role: "assistant", content: null, tool_calls: toolCalls }
+          : { role: "assistant", content: fullText };
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -323,8 +421,8 @@ const server = http.createServer(async (req, res) => {
             choices: [
               {
                 index: 0,
-                message: { role: "assistant", content: fullText },
-                finish_reason: "stop",
+                message,
+                finish_reason: toolCalls ? "tool_calls" : "stop",
               },
             ],
             usage: {
