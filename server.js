@@ -178,6 +178,27 @@ function streamAndCollect(url, res, formatToken) {
 //  This converts it to proper OpenAI tool_calls format.
 // ══════════════════════════════════════════
 
+
+// Parse XML tool calls from Kimi
+function parseXmlToolCalls(text) {
+  var calls = [];
+  var re1 = /<invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>/gi;
+  var m;
+  while ((m = re1.exec(text)) !== null) {
+    var fn = m[1], inner = m[2], params = {};
+    var re2 = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi, p;
+    while ((p = re2.exec(inner)) !== null) { params[p[1]] = p[2].trim(); }
+    var args = params.command ? JSON.stringify({command:params.command}) : Object.keys(params).length > 0 ? JSON.stringify(params) : "{}";
+    calls.push({id:"call_"+crypto.randomBytes(8).toString("hex"),type:"function",function:{name:fn,arguments:args}});
+  }
+  if (calls.length > 0) return calls;
+  var re3 = /<function_call\s+name=["']([^"']+)["']>([\s\S]*?)<\/function_call>/gi;
+  while ((m = re3.exec(text)) !== null) {
+    calls.push({id:"call_"+crypto.randomBytes(8).toString("hex"),type:"function",function:{name:m[1],arguments:m[2].trim()||"{}"}});
+  }
+  return calls.length > 0 ? calls : null;
+}
+
 function tryParseToolCalls(text) {
   if (!text || typeof text !== "string") return null;
   const trimmed = text.trim();
