@@ -290,6 +290,9 @@ async function glmChat(userMessage) {
       session_hash: session,
     });
 
+  // GLM only takes a single message string, not multi-turn.
+  // The userMessage is already flattened by the caller.
+
   // Step 1: Save textbox
   await predict(0, [userMessage]);
 
@@ -297,7 +300,7 @@ async function glmChat(userMessage) {
   await predict(14, []);
 
   // Step 3: Save conversation
-  const convRes = await predict(1, [null, []]);
+  await predict(1, [null, []]);
 
   // Step 4: Queue join (the actual LLM call)
   const joinRes = await glmFetch(`${GLM_BASE}/gradio_api/queue/join?__theme=system`, {
@@ -316,14 +319,13 @@ async function glmChat(userMessage) {
   const sseUrl = `${GLM_BASE}/gradio_api/queue/data?session_hash=${session}`;
   const result = await glmCollectSSE(sseUrl, 180000);
 
-  // Step 6: Save response
+  // Step 6: Extract response
   if (result && result.output && result.output.data) {
     const convHistory = result.output.data[1];
     if (convHistory && convHistory.length > 1) {
       const assistantMsg = convHistory[convHistory.length - 1];
       if (assistantMsg.role === "assistant" && assistantMsg.content && assistantMsg.content[0]) {
         const text = assistantMsg.content[0].text;
-        // Save response
         await predict(3, [null, convHistory]).catch(() => {});
         await predict(5, [null, null, []]).catch(() => {});
         return text;
@@ -722,15 +724,11 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (isGlm) {
-        // GLM is non-streaming — get full response then emit tokens
-        const userMsg = body.messages?.length > 0
-          ? (typeof body.messages[body.messages.length - 1].content === "string"
-            ? body.messages[body.messages.length - 1].content
-            : body.messages[body.messages.length - 1].content?.map(b => b.text || "").join("") || "")
-          : "";
+        // GLM only accepts a single message — flatten entire conversation
+        const glmMsg = messagesToPrompt(body.messages || []);
 
         try {
-          const fullText = await glmChat(userMsg);
+          const fullText = await glmChat(glmMsg);
 
           if (stream) {
             res.writeHead(200, {
