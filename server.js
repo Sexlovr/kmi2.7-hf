@@ -4,17 +4,20 @@ const crypto = require("crypto");
 
 const KIMI_BASE = "https://akhaliq-kimi-k2-7-code.hf.space";
 const MINIMAX_BASE = "https://akhaliq-minimax-m3.hf.space";
+const GLM_BASE = "https://lujin-zai-org-glm-5-1.hf.space";
 const PORT = process.env.PORT || 3000;
 
 const UPSTREAMS = {
   kimi: { base: KIMI_BASE, name: "kimi-k2.7-code", context: 131072 },
   minimax: { base: MINIMAX_BASE, name: "minimax-m3", context: 1000000 },
+  glm: { base: GLM_BASE, name: "glm-5.1", context: 128000 },
 };
 
 function resolveUpstream(model) {
   if (!model) return UPSTREAMS.kimi;
   const m = model.toLowerCase();
   if (m.includes("minimax")) return UPSTREAMS.minimax;
+  if (m.includes("glm")) return UPSTREAMS.glm;
   return UPSTREAMS.kimi;
 }
 
@@ -190,6 +193,145 @@ function streamMiniMax(messages, res, formatToken, modelName) {
     req.write(body);
     req.end();
   });
+}
+
+// ══════════════════════════════════════════
+//  GLM-5.1 API (Gradio 6.x Queue-based)
+// ══════════════════════════════════════════
+
+function glmFetch(url, body, timeout) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const reqBody = body ? JSON.stringify(body) : null;
+    const opts = {
+      method: body ? "POST" : "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "x-gradio-server": GLM_BASE + "/",
+        "x-gradio-user": "app",
+        ...(body ? {} : { Accept: "text/event-stream" }),
+      },
+      timeout: timeout || 120000,
+    };
+    const req = https.request(parsed, opts);
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.on("error", reject);
+    req.on("response", (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        try { resolve(JSON.parse(raw)); } catch { resolve(raw); }
+      });
+    });
+    if (reqBody) req.write(reqBody);
+    req.end();
+  });
+}
+
+function glmCollectSSE(url, timeout) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const req = https.request(parsed, {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+        "x-gradio-server": GLM_BASE + "/",
+      },
+      timeout: timeout || 180000,
+    });
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.on("error", reject);
+    req.on("response", (res) => {
+      let buffer = "";
+      let lastResult = null;
+      res.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.msg === "process_completed" && data.output) {
+                lastResult = data;
+              }
+            } catch {}
+          }
+        }
+      });
+      res.on("end", () => resolve(lastResult));
+    });
+    req.end();
+  });
+}
+
+async function glmChat(userMessage) {
+  const session = "glm_" + crypto.randomBytes(8).toString("hex");
+
+  // Start heartbeat
+  const hbUrl = `${GLM_BASE}/gradio_api/heartbeat/${session}`;
+  const hbParsed = new URL(hbUrl);
+  const hbReq = https.request(hbParsed, {
+    method: "GET",
+    headers: { Accept: "text/event-stream", "x-gradio-server": GLM_BASE + "/" },
+    timeout: 180000,
+  });
+  hbReq.on("error", () => {});
+  hbReq.on("response", (res) => { res.on("data", () => {}); });
+  hbReq.end();
+
+  const predict = (fnIndex, data) =>
+    glmFetch(`${GLM_BASE}/gradio_api/run/predict?__theme=system`, {
+      data,
+      event_data: null,
+      fn_index: fnIndex,
+      trigger_id: 10,
+      session_hash: session,
+    });
+
+  // Step 1: Save textbox
+  await predict(0, [userMessage]);
+
+  // Step 2: Append to history
+  await predict(14, []);
+
+  // Step 3: Save conversation
+  const convRes = await predict(1, [null, []]);
+
+  // Step 4: Queue join (the actual LLM call)
+  const joinRes = await glmFetch(`${GLM_BASE}/gradio_api/queue/join?__theme=system`, {
+    data: [null, null],
+    event_data: null,
+    fn_index: 2,
+    trigger_id: 10,
+    session_hash: session,
+  });
+
+  if (!joinRes || !joinRes.event_id) {
+    throw new Error("GLM queue/join failed");
+  }
+
+  // Step 5: Listen on queue/data for response
+  const sseUrl = `${GLM_BASE}/gradio_api/queue/data?session_hash=${session}`;
+  const result = await glmCollectSSE(sseUrl, 180000);
+
+  // Step 6: Save response
+  if (result && result.output && result.output.data) {
+    const convHistory = result.output.data[1];
+    if (convHistory && convHistory.length > 1) {
+      const assistantMsg = convHistory[convHistory.length - 1];
+      if (assistantMsg.role === "assistant" && assistantMsg.content && assistantMsg.content[0]) {
+        const text = assistantMsg.content[0].text;
+        // Save response
+        await predict(3, [null, convHistory]).catch(() => {});
+        await predict(5, [null, null, []]).catch(() => {});
+        return text;
+      }
+    }
+  }
+
+  throw new Error("GLM: no response in output");
 }
 
 function collectSSE(url) {
@@ -508,6 +650,7 @@ const server = http.createServer(async (req, res) => {
         upstreams: {
           kimi: KIMI_BASE,
           minimax: MINIMAX_BASE,
+          glm: GLM_BASE,
         },
         endpoints: [
           "POST /v1/chat/completions",
@@ -516,7 +659,7 @@ const server = http.createServer(async (req, res) => {
           "POST /chat/sync",
         ],
         routing:
-          "model containing 'minimax' → MiniMax M3, otherwise → Kimi K2.7",
+          "model containing 'minimax' → MiniMax, 'glm' → GLM-5.1, otherwise → Kimi",
       })
     );
   }
@@ -540,6 +683,12 @@ const server = http.createServer(async (req, res) => {
             created: Date.now(),
             owned_by: "akhaliq",
           },
+          {
+            id: "glm-5.1",
+            object: "model",
+            created: Date.now(),
+            owned_by: "lujin",
+          },
         ],
       })
     );
@@ -559,16 +708,73 @@ const server = http.createServer(async (req, res) => {
       // For MiniMax, send messages array directly
       // For Kimi, flatten to prompt string
       const isMiniMax = upstream === UPSTREAMS.minimax;
+      const isGlm = upstream === UPSTREAMS.glm;
       const hasTools = !isMiniMax && body.tools && body.tools.length > 0;
       const kimiMessages = hasTools ? injectToolPrompt(body.messages || [], body.tools) : body.messages || [];
       const messages = kimiMessages;
       const prompt = isMiniMax ? "" : messagesToPrompt(kimiMessages);
 
-      if (!isMiniMax && !prompt) {
+      if (!isMiniMax && !isGlm && !prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({ error: { message: "messages are required" } })
         );
+      }
+
+      if (isGlm) {
+        // GLM is non-streaming — get full response then emit tokens
+        const userMsg = body.messages?.length > 0
+          ? (typeof body.messages[body.messages.length - 1].content === "string"
+            ? body.messages[body.messages.length - 1].content
+            : body.messages[body.messages.length - 1].content?.map(b => b.text || "").join("") || "")
+          : "";
+
+        try {
+          const fullText = await glmChat(userMsg);
+
+          if (stream) {
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            });
+
+            const roleChunk = {
+              id: chatId, object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000), model: upstream.name,
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+            };
+            res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
+
+            // Emit in chunks for streaming effect
+            const chunkSize = 20;
+            for (let i = 0; i < fullText.length; i += chunkSize) {
+              res.write(openAIFormatToken(fullText.slice(i, i + chunkSize), upstream.name));
+            }
+
+            res.write(`data: ${JSON.stringify({
+              id: chatId, object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000), model: upstream.name,
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              id: chatId, object: "chat.completion",
+              created: Math.floor(Date.now() / 1000), model: upstream.name,
+              choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            }));
+          }
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "GLM upstream error: " + err.message } }));
+          }
+        }
+        return;
       }
 
       if (stream) {
@@ -1030,5 +1236,6 @@ server.listen(PORT, () => {
   console.log(`multi-ai proxy running on http://localhost:${PORT}`);
   console.log(`Kimi K2.7: ${KIMI_BASE}`);
   console.log(`MiniMax M3: ${MINIMAX_BASE}`);
-  console.log(`Routing: model "minimax" → MiniMax, otherwise → Kimi`);
+  console.log(`GLM 5.1: ${GLM_BASE}`);
+  console.log(`Routing: minimax→MiniMax, glm→GLM, default→Kimi`);
 });
