@@ -2,8 +2,21 @@ const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
 
-const HF_BASE = "https://akhaliq-kimi-k2-7-code.hf.space";
+const KIMI_BASE = "https://akhaliq-kimi-k2-7-code.hf.space";
+const MINIMAX_BASE = "https://akhaliq-minimax-m3.hf.space";
 const PORT = process.env.PORT || 3000;
+
+const UPSTREAMS = {
+  kimi: { base: KIMI_BASE, name: "kimi-k2.7-code", context: 131072 },
+  minimax: { base: MINIMAX_BASE, name: "minimax-m3", context: 1000000 },
+};
+
+function resolveUpstream(model) {
+  if (!model) return UPSTREAMS.kimi;
+  const m = model.toLowerCase();
+  if (m.includes("minimax")) return UPSTREAMS.minimax;
+  return UPSTREAMS.kimi;
+}
 
 function generateId() {
   return "chatcmpl-" + crypto.randomBytes(12).toString("hex");
@@ -77,9 +90,69 @@ function messagesToPrompt(messages) {
 }
 
 function submitToHF(prompt, history, image) {
-  return fetchJSON(`${HF_BASE}/gradio_api/call/chat`, {
+  return fetchJSON(`${KIMI_BASE}/gradio_api/call/chat`, {
     method: "POST",
     body: JSON.stringify({ data: [prompt, history || "", image || ""] }),
+  });
+}
+
+function submitToMiniMax(messages) {
+  return fetchJSON(`${MINIMAX_BASE}/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent":
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36",
+    },
+    body: JSON.stringify({ messages }),
+  });
+}
+
+function streamMiniMax(messages, res, formatToken, modelName) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ messages });
+    const parsed = new URL(`${MINIMAX_BASE}/chat`);
+    const req = https.request(parsed, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        "User-Agent":
+          "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36",
+      },
+    });
+
+    req.on("error", reject);
+    req.on("response", (hfRes) => {
+      let buffer = "";
+      let fullText = "";
+      let currentEvent = "";
+
+      hfRes.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (line.startsWith("event: ")) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith("data: ") && currentEvent !== "complete") {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.token) {
+                fullText += data.token;
+                res.write(formatToken(data.token));
+              }
+            } catch {}
+          }
+        }
+      });
+
+      hfRes.on("end", () => resolve(fullText));
+    });
+
+    req.write(body);
+    req.end();
   });
 }
 
@@ -283,12 +356,12 @@ function normalizeToolCalls(tc) {
   return null;
 }
 
-function openAIFormatToken(token) {
+function openAIFormatToken(token, modelName) {
   const chunk = {
     id: generateId(),
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
-    model: "kimi-k2.7-code",
+    model: modelName || "kimi-k2.7-code",
     choices: [
       {
         index: 0,
@@ -324,13 +397,18 @@ const server = http.createServer(async (req, res) => {
     return res.end(
       JSON.stringify({
         status: "ok",
-        upstream: HF_BASE,
+        upstreams: {
+          kimi: KIMI_BASE,
+          minimax: MINIMAX_BASE,
+        },
         endpoints: [
           "POST /v1/chat/completions",
           "POST /v1/messages",
           "POST /chat",
           "POST /chat/sync",
         ],
+        routing:
+          "model containing 'minimax' → MiniMax M3, otherwise → Kimi K2.7",
       })
     );
   }
@@ -348,6 +426,12 @@ const server = http.createServer(async (req, res) => {
             created: Date.now(),
             owned_by: "akhaliq",
           },
+          {
+            id: "minimax-m3",
+            object: "model",
+            created: Date.now(),
+            owned_by: "akhaliq",
+          },
         ],
       })
     );
@@ -360,26 +444,22 @@ const server = http.createServer(async (req, res) => {
 
     // ─── OpenAI: POST /v1/chat/completions ───
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
-      const prompt = messagesToPrompt(body.messages);
+      const upstream = resolveUpstream(body.model);
       const stream = body.stream !== false;
+      const chatId = generateId();
 
-      if (!prompt) {
+      // For MiniMax, send messages array directly
+      // For Kimi, flatten to prompt string
+      const isMiniMax = upstream === UPSTREAMS.minimax;
+      const messages = body.messages || [];
+      const prompt = isMiniMax ? "" : messagesToPrompt(messages);
+
+      if (!isMiniMax && !prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({ error: { message: "messages are required" } })
         );
       }
-
-      const submitRes = await submitToHF(prompt);
-      if (!submitRes.event_id) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        return res.end(
-          JSON.stringify({ error: { message: "Upstream rejected" } })
-        );
-      }
-
-      const sseUrl = `${HF_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
-      const chatId = generateId();
 
       if (stream) {
         res.writeHead(200, {
@@ -388,12 +468,11 @@ const server = http.createServer(async (req, res) => {
           Connection: "keep-alive",
         });
 
-        // send role chunk first
         const roleChunk = {
           id: chatId,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: "kimi-k2.7-code",
+          model: upstream.name,
           choices: [
             {
               index: 0,
@@ -404,13 +483,34 @@ const server = http.createServer(async (req, res) => {
         };
         res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
-        await streamAndCollect(sseUrl, res, openAIFormatToken);
+        if (isMiniMax) {
+          await streamMiniMax(
+            messages,
+            res,
+            (t) => openAIFormatToken(t, upstream.name),
+            upstream.name
+          );
+        } else {
+          const submitRes = await submitToHF(prompt);
+          if (!submitRes.event_id) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            return res.end(
+              JSON.stringify({ error: { message: "Upstream rejected" } })
+            );
+          }
+          const sseUrl = `${KIMI_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
+          await streamAndCollect(
+            sseUrl,
+            res,
+            (t) => openAIFormatToken(t, upstream.name)
+          );
+        }
 
         const stopChunk = {
           id: chatId,
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
-          model: "kimi-k2.7-code",
+          model: upstream.name,
           choices: [
             {
               index: 0,
@@ -423,11 +523,60 @@ const server = http.createServer(async (req, res) => {
         res.write("data: [DONE]\n\n");
         res.end();
       } else {
-        const fullText = await collectSSE(sseUrl);
+        // Non-streaming
+        let fullText;
+        if (isMiniMax) {
+          fullText = await new Promise((resolve, reject) => {
+            const bodyStr = JSON.stringify({ messages });
+            const parsed = new URL(`${MINIMAX_BASE}/chat`);
+            const req2 = https.request(parsed, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "text/event-stream",
+                "User-Agent":
+                  "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+              },
+            });
+            req2.on("error", reject);
+            req2.on("response", (hfRes) => {
+              let buffer = "";
+              let full = "";
+              let evt = "";
+              hfRes.on("data", (chunk) => {
+                buffer += chunk.toString();
+                const lines = buffer.split("\n");
+                buffer = lines.pop();
+                for (const line of lines) {
+                  if (line.startsWith("event: ")) evt = line.slice(7).trim();
+                  else if (line.startsWith("data: ") && evt !== "complete") {
+                    try {
+                      const d = JSON.parse(line.slice(6));
+                      if (d.token) full += d.token;
+                    } catch {}
+                  }
+                }
+              });
+              hfRes.on("end", () => resolve(full));
+            });
+            req2.write(bodyStr);
+            req2.end();
+          });
+        } else {
+          const submitRes = await submitToHF(prompt);
+          if (!submitRes.event_id) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            return res.end(
+              JSON.stringify({ error: { message: "Upstream rejected" } })
+            );
+          }
+          const sseUrl = `${KIMI_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
+          fullText = await collectSSE(sseUrl);
+        }
 
-        // Check if response is a tool call
-        const toolCalls = tryParseToolCalls(fullText);
-
+        // Tool call detection only for Kimi
+        const toolCalls =
+          !isMiniMax ? tryParseToolCalls(fullText) : null;
         const message = toolCalls
           ? { role: "assistant", content: null, tool_calls: toolCalls }
           : { role: "assistant", content: fullText };
@@ -438,7 +587,7 @@ const server = http.createServer(async (req, res) => {
             id: chatId,
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),
-            model: "kimi-k2.7-code",
+            model: upstream.name,
             choices: [
               {
                 index: 0,
@@ -459,8 +608,10 @@ const server = http.createServer(async (req, res) => {
 
     // ─── Claude: POST /v1/messages ───
     if (req.method === "POST" && req.url === "/v1/messages") {
-      const prompt = messagesToPrompt(body.messages);
+      const upstream = resolveUpstream(body.model);
       const stream = body.stream === true;
+      const messages = body.messages || [];
+      const prompt = messagesToPrompt(messages);
 
       if (!prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -472,18 +623,7 @@ const server = http.createServer(async (req, res) => {
         );
       }
 
-      const submitRes = await submitToHF(prompt);
-      if (!submitRes.event_id) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        return res.end(
-          JSON.stringify({
-            type: "error",
-            error: { type: "api_error", message: "Upstream rejected" },
-          })
-        );
-      }
-
-      const sseUrl = `${HF_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
+      const isMiniMax = upstream === UPSTREAMS.minimax;
 
       if (stream) {
         res.writeHead(200, {
@@ -494,7 +634,6 @@ const server = http.createServer(async (req, res) => {
 
         const msgId = "msg_" + crypto.randomBytes(16).toString("hex");
 
-        // message_start
         res.write(
           `event: message_start\ndata: ${JSON.stringify({
             type: "message_start",
@@ -503,7 +642,7 @@ const server = http.createServer(async (req, res) => {
               type: "message",
               role: "assistant",
               content: [],
-              model: "kimi-k2.7-code",
+              model: upstream.name,
               stop_reason: null,
               stop_sequence: null,
               usage: { input_tokens: 0, output_tokens: 0 },
@@ -511,7 +650,6 @@ const server = http.createServer(async (req, res) => {
           })}\n\n`
         );
 
-        // content_block_start
         res.write(
           `event: content_block_start\ndata: ${JSON.stringify({
             type: "content_block_start",
@@ -520,9 +658,23 @@ const server = http.createServer(async (req, res) => {
           })}\n\n`
         );
 
-        await streamAndCollect(sseUrl, res, claudeFormatToken);
+        if (isMiniMax) {
+          await streamMiniMax(messages, res, claudeFormatToken, upstream.name);
+        } else {
+          const submitRes = await submitToHF(prompt);
+          if (!submitRes.event_id) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            return res.end(
+              JSON.stringify({
+                type: "error",
+                error: { type: "api_error", message: "Upstream rejected" },
+              })
+            );
+          }
+          const sseUrl = `${KIMI_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
+          await streamAndCollect(sseUrl, res, claudeFormatToken);
+        }
 
-        // content_block_stop
         res.write(
           `event: content_block_stop\ndata: ${JSON.stringify({
             type: "content_block_stop",
@@ -530,7 +682,6 @@ const server = http.createServer(async (req, res) => {
           })}\n\n`
         );
 
-        // message_delta
         res.write(
           `event: message_delta\ndata: ${JSON.stringify({
             type: "message_delta",
@@ -539,7 +690,6 @@ const server = http.createServer(async (req, res) => {
           })}\n\n`
         );
 
-        // message_stop
         res.write(
           `event: message_stop\ndata: ${JSON.stringify({
             type: "message_stop",
@@ -548,7 +698,59 @@ const server = http.createServer(async (req, res) => {
 
         res.end();
       } else {
-        const fullText = await collectSSE(sseUrl);
+        let fullText;
+        if (isMiniMax) {
+          fullText = await new Promise((resolve, reject) => {
+            const bodyStr = JSON.stringify({ messages });
+            const parsed = new URL(`${MINIMAX_BASE}/chat`);
+            const req2 = https.request(parsed, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "text/event-stream",
+                "User-Agent":
+                  "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+              },
+            });
+            req2.on("error", reject);
+            req2.on("response", (hfRes) => {
+              let buffer = "";
+              let full = "";
+              let evt = "";
+              hfRes.on("data", (chunk) => {
+                buffer += chunk.toString();
+                const lines = buffer.split("\n");
+                buffer = lines.pop();
+                for (const line of lines) {
+                  if (line.startsWith("event: ")) evt = line.slice(7).trim();
+                  else if (line.startsWith("data: ") && evt !== "complete") {
+                    try {
+                      const d = JSON.parse(line.slice(6));
+                      if (d.token) full += d.token;
+                    } catch {}
+                  }
+                }
+              });
+              hfRes.on("end", () => resolve(full));
+            });
+            req2.write(bodyStr);
+            req2.end();
+          });
+        } else {
+          const submitRes = await submitToHF(prompt);
+          if (!submitRes.event_id) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            return res.end(
+              JSON.stringify({
+                type: "error",
+                error: { type: "api_error", message: "Upstream rejected" },
+              })
+            );
+          }
+          const sseUrl = `${KIMI_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
+          fullText = await collectSSE(sseUrl);
+        }
+
         const msgId = "msg_" + crypto.randomBytes(16).toString("hex");
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -558,7 +760,7 @@ const server = http.createServer(async (req, res) => {
             type: "message",
             role: "assistant",
             content: [{ type: "text", text: fullText }],
-            model: "kimi-k2.7-code",
+            model: upstream.name,
             stop_reason: "end_turn",
             stop_sequence: null,
             usage: { input_tokens: 0, output_tokens: 0 },
@@ -573,51 +775,117 @@ const server = http.createServer(async (req, res) => {
       const prompt = body.prompt || "";
       const history = body.history_json || "";
       const image = body.image_b64 || "";
+      const model = body.model || "";
 
       if (!prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ error: "prompt is required" }));
       }
 
-      const submitRes = await submitToHF(prompt, history, image);
-      if (!submitRes.event_id) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        return res.end(
-          JSON.stringify({ error: "Upstream rejected", detail: submitRes })
+      const upstream = resolveUpstream(model);
+
+      if (upstream === UPSTREAMS.minimax) {
+        const messages = [{ role: "user", content: prompt }];
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        await streamMiniMax(
+          messages,
+          res,
+          (t) => `data: ${JSON.stringify([t])}\n\n`
+        );
+        res.end();
+      } else {
+        const submitRes = await submitToHF(prompt, history, image);
+        if (!submitRes.event_id) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          return res.end(
+            JSON.stringify({ error: "Upstream rejected", detail: submitRes })
+          );
+        }
+
+        const sseUrl = `${KIMI_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
+
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+
+        return streamAndCollect(
+          sseUrl,
+          res,
+          (t) => `data: ${JSON.stringify([t])}\n\n`
         );
       }
-
-      const sseUrl = `${HF_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
-
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-
-      return streamAndCollect(sseUrl, res, (token) => `data: ${JSON.stringify([token])}\n\n`);
     }
 
     if (req.method === "POST" && req.url === "/chat/sync") {
       const prompt = body.prompt || "";
       const history = body.history_json || "";
       const image = body.image_b64 || "";
+      const model = body.model || "";
 
       if (!prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ error: "prompt is required" }));
       }
 
-      const submitRes = await submitToHF(prompt, history, image);
-      if (!submitRes.event_id) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        return res.end(
-          JSON.stringify({ error: "Upstream rejected", detail: submitRes })
-        );
-      }
+      const upstream = resolveUpstream(model);
 
-      const sseUrl = `${HF_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
-      const fullText = await collectSSE(sseUrl);
+      let fullText;
+      if (upstream === UPSTREAMS.minimax) {
+        const messages = [{ role: "user", content: prompt }];
+        fullText = await new Promise((resolve, reject) => {
+          const bodyStr = JSON.stringify({ messages });
+          const parsed = new URL(`${MINIMAX_BASE}/chat`);
+          const req2 = https.request(parsed, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "User-Agent":
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+            },
+          });
+          req2.on("error", reject);
+          req2.on("response", (hfRes) => {
+            let buffer = "";
+            let full = "";
+            let evt = "";
+            hfRes.on("data", (chunk) => {
+              buffer += chunk.toString();
+              const lines = buffer.split("\n");
+              buffer = lines.pop();
+              for (const line of lines) {
+                if (line.startsWith("event: ")) evt = line.slice(7).trim();
+                else if (line.startsWith("data: ") && evt !== "complete") {
+                  try {
+                    const d = JSON.parse(line.slice(6));
+                    if (d.token) full += d.token;
+                  } catch {}
+                }
+              }
+            });
+            hfRes.on("end", () => resolve(full));
+          });
+          req2.write(bodyStr);
+          req2.end();
+        });
+      } else {
+        const submitRes = await submitToHF(prompt, history, image);
+        if (!submitRes.event_id) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          return res.end(
+            JSON.stringify({ error: "Upstream rejected", detail: submitRes })
+          );
+        }
+
+        const sseUrl = `${KIMI_BASE}/gradio_api/call/chat/${submitRes.event_id}`;
+        fullText = await collectSSE(sseUrl);
+      }
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ response: fullText }));
@@ -636,6 +904,7 @@ const server = http.createServer(async (req, res) => {
           "GET /v1/models": "List models",
           "GET /health": "Health check",
         },
+        routing: "model containing 'minimax' → MiniMax M3, otherwise → Kimi K2.7",
       })
     );
   } catch (err) {
@@ -647,6 +916,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`kmi2.7 proxy running on http://localhost:${PORT}`);
-  console.log(`Upstream: ${HF_BASE}`);
+  console.log(`multi-ai proxy running on http://localhost:${PORT}`);
+  console.log(`Kimi K2.7: ${KIMI_BASE}`);
+  console.log(`MiniMax M3: ${MINIMAX_BASE}`);
+  console.log(`Routing: model "minimax" → MiniMax, otherwise → Kimi`);
 });
