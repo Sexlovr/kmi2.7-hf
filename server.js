@@ -89,6 +89,42 @@ function messagesToPrompt(messages) {
     .join("\n\n");
 }
 
+function buildToolPrompt(tools) {
+  if (!tools || tools.length === 0) return "";
+  const toolDesc = tools
+    .map((t) => {
+      const fn = t.function || t;
+      const params = fn.parameters?.properties
+        ? Object.entries(fn.parameters.properties)
+            .map(([k, v]) => `    - ${k} (${v.type}${v.description ? ": " + v.description : ""})${fn.parameters.required?.includes(k) ? " [required]" : ""}`)
+            .join("\n")
+        : "    (no parameters)";
+      return `  - ${fn.name}: ${fn.description || ""}\n${params}`;
+    })
+    .join("\n\n");
+
+  return `\n\n[SYSTEM INSTRUCTION - TOOL CALLING MODE]\nYou have access to the following tools:\n${toolDesc}\n\nWhen you need to call a tool, you MUST output EXACTLY this JSON format and nothing else:\n{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"TOOL_NAME","arguments":"{\\"param\\":\\"value\\"}"}}]}\n\nDo NOT wrap in markdown. Do NOT add explanation. Output ONLY the raw JSON object when calling a tool. If you don't need a tool, respond normally.`;
+}
+
+function injectToolPrompt(messages, tools) {
+  if (!tools || tools.length === 0) return messages;
+  const toolList = tools
+    .map((t) => {
+      const fn = t.function || t;
+      return `- ${fn.name}: ${fn.description || "no description"}\n  Parameters: ${JSON.stringify(fn.parameters || {})}`;
+    })
+    .join("\n");
+  const toolSystem = `[SYSTEM]: You have access to the following tools:\n${toolList}\n\nWhen you need to call a tool, you MUST respond with ONLY a JSON object in this exact format (no markdown, no explanation):\n{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"TOOL_NAME","arguments":"{\\"param\\":\\"value\\"}"}}]}\nThe "arguments" field must be a JSON string (escaped). Do NOT use markdown code blocks. Do NOT add any text before or after the JSON.`;
+  const msgs = [...messages];
+  const sysIdx = msgs.findIndex((m) => m.role === "system");
+  if (sysIdx >= 0) {
+    msgs[sysIdx] = { ...msgs[sysIdx], content: msgs[sysIdx].content + "\n\n" + toolSystem };
+  } else {
+    msgs.unshift({ role: "system", content: toolSystem });
+  }
+  return msgs;
+}
+
 function submitToHF(prompt, history, image) {
   return fetchJSON(`${KIMI_BASE}/gradio_api/call/chat`, {
     method: "POST",
@@ -247,12 +283,22 @@ function streamAndCollect(url, res, formatToken) {
 
 // ══════════════════════════════════════════
 //  Tool Call Converter
-//  Kimi outputs {"tool_calls":...} as a string inside content.
-//  This converts it to proper OpenAI tool_calls format.
+//  Kimi outputs tool calls in various formats inside content.
+//  This converts them to proper OpenAI tool_calls format.
 // ══════════════════════════════════════════
 
+// Known tool names that map to code block languages
+const CODE_LANG_TO_TOOL = {
+  bash: "bash", sh: "bash", shell: "bash", zsh: "bash",
+  python: "python", python3: "python", py: "python",
+  javascript: "execute_code", js: "execute_code", node: "execute_code",
+  typescript: "execute_code", ts: "execute_code",
+  ruby: "execute_code", rb: "execute_code",
+  go: "execute_code", rust: "execute_code", c: "execute_code", cpp: "execute_code",
+  java: "execute_code", php: "execute_code", lua: "execute_code",
+  powershell: "execute_code", pwsh: "execute_code",
+};
 
-// Parse XML tool calls from Kimi
 function parseXmlToolCalls(text) {
   var calls = [];
   var re1 = /<invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>/gi;
@@ -272,11 +318,11 @@ function parseXmlToolCalls(text) {
   return calls.length > 0 ? calls : null;
 }
 
-function tryParseToolCalls(text) {
+function tryParseToolCalls(text, availableTools) {
   if (!text || typeof text !== "string") return null;
   const trimmed = text.trim();
 
-  // Direct JSON object with tool_calls
+  // 1. Direct JSON object with tool_calls
   if (trimmed.startsWith('{"tool_calls"') || trimmed.startsWith('{"tool_calls":')) {
     try {
       const obj = JSON.parse(trimmed);
@@ -284,24 +330,86 @@ function tryParseToolCalls(text) {
     } catch {}
   }
 
-  // JSON embedded in text: extract the first { ... } block
-  const jsonStart = trimmed.indexOf('{"tool_calls"');
-  if (jsonStart > 0) {
-    // Find matching closing brace
+  // 2. JSON embedded in text: extract the first { ... } block with tool_calls
+  const tcStart = trimmed.indexOf('{"tool_calls"');
+  if (tcStart > 0) {
     let depth = 0;
-    for (let i = jsonStart; i < trimmed.length; i++) {
+    for (let i = tcStart; i < trimmed.length; i++) {
       if (trimmed[i] === "{") depth++;
       else if (trimmed[i] === "}") {
         depth--;
         if (depth === 0) {
           try {
-            const obj = JSON.parse(trimmed.slice(jsonStart, i + 1));
+            const obj = JSON.parse(trimmed.slice(tcStart, i + 1));
             if (obj.tool_calls) return normalizeToolCalls(obj.tool_calls);
           } catch {}
           break;
         }
       }
     }
+  }
+
+  // 3. XML tool calls
+  const xmlCalls = parseXmlToolCalls(text);
+  if (xmlCalls) return xmlCalls;
+
+  // 4. Markdown code blocks — convert to tool calls if tools were provided
+  if (availableTools && availableTools.length > 0) {
+    const toolNames = new Set(availableTools.map(t => t.function?.name || t.name || ""));
+    const codeBlockRe = /```(\w+)?\s*\n([\s\S]*?)```/g;
+    let match;
+    const calls = [];
+    while ((match = codeBlockRe.exec(trimmed)) !== null) {
+      const lang = (match[1] || "").toLowerCase();
+      const code = match[2].trim();
+      if (!code) continue;
+
+      // Try to match language to a tool name
+      let toolName = CODE_LANG_TO_TOOL[lang];
+      if (toolName && toolNames.has(toolName)) {
+        calls.push({
+          id: "call_" + crypto.randomBytes(8).toString("hex"),
+          type: "function",
+          function: {
+            name: toolName,
+            arguments: JSON.stringify({ command: code }),
+          },
+        });
+      } else if (lang === "json" || lang === "") {
+        // Try to parse JSON inside code block
+        try {
+          const obj = JSON.parse(code);
+          if (obj.tool_calls) return normalizeToolCalls(obj.tool_calls);
+          if (obj.function_call) {
+            return [{
+              id: "call_" + crypto.randomBytes(8).toString("hex"),
+              type: "function",
+              function: {
+                name: obj.function_call.name || "unknown",
+                arguments: typeof obj.function_call.arguments === "string"
+                  ? obj.function_call.arguments
+                  : JSON.stringify(obj.function_call.arguments || {}),
+              },
+            }];
+          }
+          if (obj.tool && obj.arguments) {
+            if (toolNames.has(obj.tool)) {
+              calls.push({
+                id: "call_" + crypto.randomBytes(8).toString("hex"),
+                type: "function",
+                function: {
+                  name: obj.tool,
+                  arguments: typeof obj.arguments === "string"
+                    ? obj.arguments
+                    : JSON.stringify(obj.arguments),
+                },
+              });
+            }
+          }
+        } catch {}
+      }
+    }
+    if (calls.length > 0) return calls;
   }
 
   return null;
@@ -451,8 +559,10 @@ const server = http.createServer(async (req, res) => {
       // For MiniMax, send messages array directly
       // For Kimi, flatten to prompt string
       const isMiniMax = upstream === UPSTREAMS.minimax;
-      const messages = body.messages || [];
-      const prompt = isMiniMax ? "" : messagesToPrompt(messages);
+      const hasTools = !isMiniMax && body.tools && body.tools.length > 0;
+      const kimiMessages = hasTools ? injectToolPrompt(body.messages || [], body.tools) : body.messages || [];
+      const messages = kimiMessages;
+      const prompt = isMiniMax ? "" : messagesToPrompt(kimiMessages);
 
       if (!isMiniMax && !prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -576,7 +686,7 @@ const server = http.createServer(async (req, res) => {
 
         // Tool call detection only for Kimi
         const toolCalls =
-          !isMiniMax ? tryParseToolCalls(fullText) : null;
+          !isMiniMax ? tryParseToolCalls(fullText, body.tools) : null;
         const message = toolCalls
           ? { role: "assistant", content: null, tool_calls: toolCalls }
           : { role: "assistant", content: fullText };
@@ -610,8 +720,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/v1/messages") {
       const upstream = resolveUpstream(body.model);
       const stream = body.stream === true;
-      const messages = body.messages || [];
-      const prompt = messagesToPrompt(messages);
+      const isMiniMax = upstream === UPSTREAMS.minimax;
+      const hasTools = !isMiniMax && body.tools && body.tools.length > 0;
+      const kimiMessages = hasTools ? injectToolPrompt(body.messages || [], body.tools) : body.messages || [];
+      const messages = kimiMessages;
+      const prompt = messagesToPrompt(kimiMessages);
 
       if (!prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -622,8 +735,6 @@ const server = http.createServer(async (req, res) => {
           })
         );
       }
-
-      const isMiniMax = upstream === UPSTREAMS.minimax;
 
       if (stream) {
         res.writeHead(200, {
