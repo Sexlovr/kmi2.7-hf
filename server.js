@@ -850,11 +850,15 @@ const server = http.createServer(async (req, res) => {
             res.end();
           } else {
             const fullText = await glm52Chat(body.messages || [], false, body.model);
+            const toolCalls = body.tools && body.tools.length > 0 ? tryParseToolCalls(fullText, body.tools) : null;
+            const message = toolCalls
+              ? { role: "assistant", content: null, tool_calls: toolCalls }
+              : { role: "assistant", content: fullText };
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
               id: chatId, object: "chat.completion",
               created: Math.floor(Date.now() / 1000), model: upstream.name,
-              choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+              choices: [{ index: 0, message, finish_reason: toolCalls ? "tool_calls" : "stop" }],
               usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
             }));
           }
