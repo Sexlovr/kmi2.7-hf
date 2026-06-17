@@ -5,18 +5,24 @@ const crypto = require("crypto");
 const KIMI_BASE = "https://akhaliq-kimi-k2-7-code.hf.space";
 const MINIMAX_BASE = "https://akhaliq-minimax-m3.hf.space";
 const GLM_BASE = "https://lujin-zai-org-glm-5-1.hf.space";
+const GLM52_BASE = "https://akhaliq-glm-5-2.hf.space";
 const PORT = process.env.PORT || 3000;
 
 const UPSTREAMS = {
   kimi: { base: KIMI_BASE, name: "kimi-k2.7-code", context: 131072 },
   minimax: { base: MINIMAX_BASE, name: "minimax-m3", context: 1000000 },
   glm: { base: GLM_BASE, name: "glm-5.1", context: 128000 },
+  "glm-5.2": { base: GLM52_BASE, name: "glm-5.2", context: 128000 },
+  "glm-5.2-code": { base: GLM52_BASE, name: "glm-5.2-code", context: 128000 },
 };
+
+const TERMINAL_SYSTEM_PROMPT = "You are a senior system administrator and Unix terminal helper. Answer requests using command-line commands, scripts, code configurations, and wrap instructions in monospaced outputs.";
 
 function resolveUpstream(model) {
   if (!model) return UPSTREAMS.kimi;
   const m = model.toLowerCase();
   if (m.includes("minimax")) return UPSTREAMS.minimax;
+  if (m === "glm-5.2" || m === "glm-5.2-code") return UPSTREAMS[m];
   if (m.includes("glm")) return UPSTREAMS.glm;
   return UPSTREAMS.kimi;
 }
@@ -336,6 +342,87 @@ async function glmChat(userMessage) {
   throw new Error("GLM: no response in output");
 }
 
+// ══════════════════════════════════════════
+//  GLM-5.2 API (OpenAI-compatible /api/chat)
+// ══════════════════════════════════════════
+
+function glm52Chat(messages, stream, modelName) {
+  const isCode = modelName && modelName.includes("code");
+  const msgs = isCode
+    ? [{ role: "system", content: TERMINAL_SYSTEM_PROMPT }, ...messages.filter(m => m.role !== "system")]
+    : messages;
+
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      messages: msgs,
+      model: "zai-org/GLM-5.2:fireworks-ai",
+      temperature: 0.7,
+      stream: !!stream,
+    });
+    const parsed = new URL(`${GLM52_BASE}/api/chat`);
+    const req = https.request(parsed, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Origin": GLM52_BASE,
+        "User-Agent": "Mozilla/5.0",
+        ...(stream ? { Accept: "text/event-stream" } : {}),
+      },
+      timeout: 120000,
+    });
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.on("error", reject);
+    req.on("response", (res) => {
+      if (stream) {
+        resolve(res);
+      } else {
+        let buf = "";
+        res.on("data", (c) => buf += c.toString());
+        res.on("end", () => {
+          // Non-streaming: collect all data: lines
+          let full = "";
+          for (const line of buf.split("\n")) {
+            if (line.startsWith("data: ") && line !== "data: [DONE]") {
+              try { full += JSON.parse(line.slice(6)).content || ""; } catch {}
+            }
+          }
+          resolve(full);
+        });
+      }
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+function streamGLM52(resStream, res, formatToken) {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    let fullText = "";
+
+    resStream.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (line.startsWith("data: ") && line !== "data: [DONE]") {
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.content) {
+              fullText += data.content;
+              res.write(formatToken(data.content));
+            }
+          } catch {}
+        }
+      }
+    });
+
+    resStream.on("end", () => resolve(fullText));
+    resStream.on("error", reject);
+  });
+}
+
 function collectSSE(url) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -635,8 +722,9 @@ function claudeFormatToken(token) {
 
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Max-Age", "86400");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -691,6 +779,18 @@ const server = http.createServer(async (req, res) => {
             created: Date.now(),
             owned_by: "lujin",
           },
+          {
+            id: "glm-5.2",
+            object: "model",
+            created: Date.now(),
+            owned_by: "akhaliq",
+          },
+          {
+            id: "glm-5.2-code",
+            object: "model",
+            created: Date.now(),
+            owned_by: "akhaliq",
+          },
         ],
       })
     );
@@ -711,16 +811,60 @@ const server = http.createServer(async (req, res) => {
       // For Kimi, flatten to prompt string
       const isMiniMax = upstream === UPSTREAMS.minimax;
       const isGlm = upstream === UPSTREAMS.glm;
+      const isGlm52 = upstream === UPSTREAMS["glm-5.2"] || upstream === UPSTREAMS["glm-5.2-code"];
       const hasTools = !isMiniMax && body.tools && body.tools.length > 0;
       const kimiMessages = hasTools ? injectToolPrompt(body.messages || [], body.tools) : body.messages || [];
       const messages = kimiMessages;
       const prompt = isMiniMax ? "" : messagesToPrompt(kimiMessages);
 
-      if (!isMiniMax && !isGlm && !prompt) {
+      if (!isMiniMax && !isGlm && !isGlm52 && !prompt) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({ error: { message: "messages are required" } })
         );
+      }
+
+      if (isGlm52) {
+        // GLM-5.2 — OpenAI-compatible /api/chat
+        try {
+          if (stream) {
+            const resStream = await glm52Chat(body.messages || [], true, body.model);
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            });
+            const roleChunk = {
+              id: chatId, object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000), model: upstream.name,
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+            };
+            res.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
+            const fullText = await streamGLM52(resStream, res, (t) => openAIFormatToken(t, upstream.name));
+            res.write(`data: ${JSON.stringify({
+              id: chatId, object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000), model: upstream.name,
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else {
+            const fullText = await glm52Chat(body.messages || [], false, body.model);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              id: chatId, object: "chat.completion",
+              created: Math.floor(Date.now() / 1000), model: upstream.name,
+              choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            }));
+          }
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "GLM-5.2 error: " + err.message } }));
+          }
+        }
+        return;
       }
 
       if (isGlm) {
